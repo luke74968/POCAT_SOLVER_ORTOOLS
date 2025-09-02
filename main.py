@@ -33,7 +33,7 @@ def main():
     # 4. 솔버 생성 및 탐색 시간 설정
     solver = cp_model.CpSolver()
     solver.parameters.log_search_progress = True
-    solver.parameters.max_time_in_seconds = 30.0 # 최대 30초간 최적해 탐색
+    solver.parameters.max_time_in_seconds = 300.0 # 최대 30초간 최적해 탐색
     
     # 5. 솔버 실행 (SolutionLogger 없이)
     print("\n🔍 최적의 대표 솔루션 탐색 시작...")

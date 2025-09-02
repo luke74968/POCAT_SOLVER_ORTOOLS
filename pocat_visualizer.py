@@ -78,12 +78,10 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
         i_in_sleep = actual_i_ins_sleep.get(ic_name, 0)
         thermal_margin = ic.t_junction_max - calculated_tj
         
-        # --- [핵심 수정] Always-On 경로 여부에 따라 색상 결정 ---
         node_color = 'blue'
         fill_color = 'white' if ic_name in always_on_nodes else 'lightgrey'
         if thermal_margin < 10: node_color = 'red'
         elif thermal_margin < 25: node_color = 'orange'
-        # --- 수정 끝 ---
         
         label = (f"📦 {ic.name.split('@')[0]}\n\n"
             f"Vin: {ic.vin:.2f}V, Vout: {ic.vout:.2f}V\n"
@@ -100,9 +98,7 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
             sequenced_loads.add(seq['j']); sequenced_loads.add(seq['k'])
             
     for load in loads:
-        # --- [핵심 수정] Always-On 경로 여부에 따라 색상 결정 ---
         fill_color = 'white' if load.name in always_on_nodes else 'lightgrey'
-        # --- 수정 끝 ---
 
         label = f"💡 {load.name}\nActive: {load.voltage_typical}V | {load.current_active*1000:.1f}mA\n"
         if load.current_sleep > 0: label += f"Sleep: {load.current_sleep * 1000000:,.1f}µA\n"
@@ -111,7 +107,7 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
         if load.name in sequenced_loads: conditions.append("⛓️ Sequence")
         if conditions: label += " ".join(conditions)
         penwidth = '1'
-        if load.current_sleep > 0: penwidth = '3'
+        if load.always_on_in_sleep: penwidth = '3'
         dot.node(load.name, label, color='dimgray', fillcolor=fill_color, penwidth=penwidth)
         
     for p_name, c_name in solution['active_edges']:
@@ -124,34 +120,13 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
     loads_map = {load.name: load for load in loads}
     print(f"\n{'='*20} 솔루션 (비용: ${solution['cost']:.2f}) {'='*20}")
     
-    # 상세 계산 로직...
     used_ic_objects = [ic for ic in candidate_ics if ic.name in solution['used_ic_names']]
-    actual_current_draw = {load.name: load.current_active for load in loads}; sleep_current_draw = {load.name: load.current_sleep for load in loads}
+    actual_current_draw = {load.name: load.current_active for load in loads}
+    sleep_current_draw = {load.name: load.current_sleep for load in loads}
     junction_temps, actual_i_ins, actual_i_outs, actual_i_ins_sleep = {}, {}, {}, {}
     processed_ics = set()
     child_to_parent = {c: p for p, c in solution['active_edges']}
 
-    while len(processed_ics) < len(used_ic_objects):
-        for ic in used_ic_objects:
-            if ic.name in processed_ics: continue
-            children_names = [c for p, c in solution['active_edges'] if p == ic.name]
-            if all(c_name in actual_current_draw for c_name in children_names):
-                total_i_out = sum(actual_current_draw[c_name] for c_name in children_names); actual_i_outs[ic.name] = total_i_out
-                i_in = ic.calculate_input_current(vin=ic.vin, i_out=total_i_out); actual_current_draw[ic.name] = i_in; actual_i_ins[ic.name] = i_in
-                power_loss = ic.calculate_power_loss(vin=ic.vin, i_out=total_i_out); ambient_temp = constraints.get('ambient_temperature', 25)
-                junction_temps[ic.name] = ambient_temp + (power_loss * ic.theta_ja)
-                total_i_out_sleep = sum(sleep_current_draw.get(c_name, 0) for c_name in children_names)
-                ic_self_consumption = ic.quiescent_current
-                if total_i_out_sleep > 0: ic_self_consumption = ic.operating_current
-                i_in_sleep = 0
-                if isinstance(ic, LDO): i_in_sleep = total_i_out_sleep + ic_self_consumption
-                elif isinstance(ic, BuckConverter):
-                    p_out_sleep = ic.vout * total_i_out_sleep; p_in_sleep = (p_out_sleep / 0.8) if 0.8 > 0 else 0
-                    i_in_sleep = (p_in_sleep / ic.vin) + ic_self_consumption
-                actual_i_ins_sleep[ic.name] = i_in_sleep; sleep_current_draw[ic.name] = i_in_sleep
-                processed_ics.add(ic.name)
-
-    # --- [핵심 수정] Always-On 경로 추적 ---
     always_on_nodes = {l.name for l in loads if l.always_on_in_sleep}
     nodes_to_process = list(always_on_nodes)
     while nodes_to_process:
@@ -161,7 +136,53 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
             if parent not in always_on_nodes:
                 always_on_nodes.add(parent)
                 nodes_to_process.append(parent)
-    # --- 수정 끝 ---
+
+    while len(processed_ics) < len(used_ic_objects):
+        for ic in used_ic_objects:
+            if ic.name in processed_ics: continue
+            children_names = [c for p, c in solution['active_edges'] if p == ic.name]
+            
+            if all(c in loads_map or c in processed_ics for c in children_names):
+                # Active current calculation (기존과 동일)
+                total_i_out_active = sum(actual_current_draw.get(c, 0) for c in children_names)
+                actual_i_outs[ic.name] = total_i_out_active
+                i_in_active = ic.calculate_input_current(vin=ic.vin, i_out=total_i_out_active)
+                actual_current_draw[ic.name] = i_in_active
+                actual_i_ins[ic.name] = i_in_active
+                power_loss = ic.calculate_power_loss(vin=ic.vin, i_out=total_i_out_active)
+                ambient_temp = constraints.get('ambient_temperature', 25)
+                junction_temps[ic.name] = ambient_temp + (power_loss * ic.theta_ja)
+                
+                # --- [핵심 수정] Sleep current calculation ---
+                i_in_sleep = 0
+                parent_name = child_to_parent.get(ic.name)
+
+                # 1. Always-On 경로에 있는 IC일 경우
+                if ic.name in always_on_nodes:
+                    total_i_out_sleep = sum(sleep_current_draw.get(c, 0) for c in children_names)
+                    # Always-On 경로에서는 부하를 구동하므로 operating_current 사용
+                    ic_self_consumption = ic.operating_current
+                    
+                    if isinstance(ic, LDO):
+                        i_in_sleep = total_i_out_sleep + ic_self_consumption
+                    elif isinstance(ic, BuckConverter):
+                        if ic.vin > 0:
+                            p_out_sleep = ic.vout * total_i_out_sleep
+                            p_in_sleep = p_out_sleep / 0.8 if p_out_sleep > 0 else 0
+                            i_in_sleep = (p_in_sleep / ic.vin) + ic_self_consumption
+
+                # 2. 일반(non-Always-On) 경로에 있으면서, 배터리에 직결된 IC일 경우
+                elif parent_name == battery.name:
+                    # 기능은 꺼지지만 입력 전원은 살아있으므로 quiescent_current만 소모
+                    i_in_sleep = ic.quiescent_current
+
+                # 3. 일반 경로의 나머지 하위 IC들은 입력 전원이 차단되므로 i_in_sleep = 0
+                
+                actual_i_ins_sleep[ic.name] = i_in_sleep
+                sleep_current_draw[ic.name] = i_in_sleep
+                # --- 수정 끝 ---
+
+                processed_ics.add(ic.name)
     
     primary_ics = [c_name for p_name, c_name in solution['active_edges'] if p_name == battery.name]
     total_active_current = sum(actual_i_ins.get(ic_name, 0) for ic_name in primary_ics)
@@ -199,7 +220,7 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
         solution, candidate_ics, loads, battery, constraints,
         junction_temps, actual_i_ins, actual_i_outs, actual_i_ins_sleep,
         total_active_power, total_active_current, total_sleep_current,
-        always_on_nodes # 새로 추가된 파라미터
+        always_on_nodes
     )
     output_filename = f'solution_{solution_index}_cost_{solution["cost"]:.2f}'
     dot_graph.render(output_filename, view=True, cleanup=True, format='png')

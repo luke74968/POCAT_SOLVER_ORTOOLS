@@ -98,9 +98,14 @@ def expand_ic_instances(available_ics: List[PowerIC], loads: List[Load], battery
                 for i in range(num_potential_loads):
                     concrete_ic = copy.deepcopy(template_ic); concrete_ic.vin, concrete_ic.vout = vin, vout
                     concrete_ic.name = f"{group_key}_copy{i+1}"
+                    
+                    # --- [핵심 수정] 열 마진 계산 전, 원래 스펙 저장 ---
+                    concrete_ic.original_i_limit = template_ic.i_limit
+                    # --- 수정 끝 ---
+
                     derated_limit = calculate_derated_current_limit(concrete_ic, constraints)
                     if derated_limit <= 0: continue
-                    concrete_ic.i_limit = derated_limit
+                    concrete_ic.i_limit = derated_limit # 열 마진이 적용된 값으로 덮어쓰기
                     candidate_ics.append(concrete_ic); current_group.append(concrete_ic.name)
                 if current_group: ic_groups[group_key] = current_group
     print(f"   - (필터링 포함) 생성된 최종 후보 IC 인스턴스: {len(candidate_ics)}개")
@@ -158,10 +163,19 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
         realistic_i_out = min(ic.i_limit, max_potential_i_out)
         child_current_draw[ic.name] = int(ic.calculate_input_current(vin=ic.vin, i_out=realistic_i_out) * SCALE)
 
-    margin = constraints.get('current_margin', 0.1)
+    # --- [핵심 수정] 열 마진과 전기 마진 제약조건 분리 ---
+    current_margin = constraints.get('current_margin', 0.1)
     for p in candidate_ics:
         terms = [child_current_draw[c.name] * edges[p.name, c.name] for c in all_ic_and_load_nodes if (p.name, c.name) in edges]
-        if terms: model.Add(sum(terms) <= int(p.i_limit * (1 + margin) * SCALE))
+        if terms:
+            # 1. 열 마진이 적용된 전류 한계 (절대 넘으면 안되는 값)
+            # p.i_limit은 이미 derating된 값임
+            model.Add(sum(terms) <= int(p.i_limit * SCALE))
+            
+            # 2. 전기 마진이 적용된 전류 한계 (설계 여유분)
+            # p.original_i_limit은 derating 전의 원래 스펙
+            model.Add(sum(terms) <= int(p.original_i_limit * (1 - current_margin) * SCALE))
+    # --- 수정 끝 ---
         
     if 'power_sequences' in constraints:
         for seq in constraints['power_sequences']:
@@ -170,7 +184,9 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
                 for p in candidate_ics:
                     if (p.name, j) in edges and (p.name, k) in edges: model.Add(edges[p.name, j] + edges[p.name, k] <= 1)
 
-    # --- [핵심 수정] "soft"와 "hard" Independent Rail 제약조건 로직 (최종 수정) ---
+    # ... (이하 코드는 이전과 동일)
+    
+    # --- Independent Rail 제약조건 ---
     num_children_vars = {p.name: model.NewIntVar(0, len(all_ic_and_load_nodes), f"num_children_{p.name}") for p in parent_nodes}
     for p in parent_nodes:
         outgoing_edges = [edges[p.name, c.name] for c in all_ic_and_load_nodes if (p.name, c.name) in edges]
@@ -184,31 +200,97 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
         
         elif load.independent_rail_type == 'hard':
             is_on_hard_path = {node.name: model.NewBoolVar(f"on_hard_path_{load.name}_{node.name}") for node in all_nodes}
-            
-            # 1. hard load 자신은 항상 '전용도로' 위에 있음
             model.Add(is_on_hard_path[load.name] == 1)
             for other_load in loads:
                 if other_load.name != load.name:
                     model.Add(is_on_hard_path[other_load.name] == 0)
-
-            # 2. '전용도로' 속성을 부모에게 연쇄적으로 전파
             for c_node in all_ic_and_load_nodes:
                 for p_node in parent_nodes:
                     if (p_node.name, c_node.name) in edges:
-                        # "만약 (부모 p -> 자식 c) 연결이 활성화되고, 자식 c가 경로 위에 있다면, 부모 p도 경로 위에 있어야 한다."
                         model.AddImplication(is_on_hard_path[c_node.name], is_on_hard_path[p_node.name]).OnlyEnforceIf(edges[(p_node.name, c_node.name)])
-            
-            # 3. 최종 규칙: '전용도로' 위의 모든 IC는 자식을 하나만 가질 수 있음
             for p_ic in candidate_ics:
                 model.Add(num_children_vars[p_ic.name] <= 1).OnlyEnforceIf(is_on_hard_path[p_ic.name])
-    # --- 수정 끝 ---
+
+    # --- Always-On 경로 분리 + 전파 (정확한 AND/OR 선형화) ---
+    # 1) 노드 AO 변수
+    is_always_on_path = {node.name: model.NewBoolVar(f"is_ao_{node.name}") for node in all_nodes}
+
+    # 2) Load는 config대로 고정
+    for ld in loads:
+        model.Add(is_always_on_path[ld.name] == int(ld.always_on_in_sleep))
+
+    # 3) IC의 AO = OR_j ( edge(ic->child_j) AND is_ao[child_j] )
+    for ic in candidate_ics:
+        children = [c for c in all_ic_and_load_nodes if (ic.name, c.name) in edges]
+        if not children:
+            model.Add(is_always_on_path[ic.name] == 0)
+            continue
+
+        z_list = []  # z_j = edge AND child_is_ao
+        for ch in children:
+            e = edges[(ic.name, ch.name)]
+            z = model.NewBoolVar(f"ao_and_{ic.name}__{ch.name}")
+            # z = e ∧ is_ao[ch]  (⇔로 선형화)
+            model.Add(z <= e)
+            model.Add(z <= is_always_on_path[ch.name])
+            model.Add(z >= e + is_always_on_path[ch.name] - 1)
+            z_list.append(z)
+
+        # is_ao[ic] == OR(z_list)
+        for z in z_list:
+            model.Add(is_always_on_path[ic.name] >= z)
+        model.Add(is_always_on_path[ic.name] <= sum(z_list))
+
+    # 4) 같은 부모 아래에서 AO/비-AO 혼용 방지(선택)
+    for p in candidate_ics:
+        chs = [c for c in all_ic_and_load_nodes if (p.name, c.name) in edges]
+        for i in range(len(chs) - 1):
+            for j in range(i + 1, len(chs)):
+                c1, c2 = chs[i], chs[j]
+                model.Add(is_always_on_path[c1.name] == is_always_on_path[c2.name]).OnlyEnforceIf([
+                    edges[(p.name, c1.name)],
+                    edges[(p.name, c2.name)],
+                ])
     
+    # --- Sleep-current budget: AO 경로만 Iop, 비-AO 탑레벨은 Iq, 그 외 0 ---
     if constraints.get('max_sleep_current', 0) > 0:
-        ic_sleep_terms = [int(ic.operating_current * SCALE) * ic_is_used[ic.name] for ic in candidate_ics]
-        always_on_loads = [l for l in loads if l.always_on_in_sleep]
-        load_sleep_total = int(sum(load.current_sleep for load in always_on_loads) * SCALE)
-        model.Add(sum(ic_sleep_terms) + load_sleep_total <= int(constraints['max_sleep_current'] * SCALE))
-        
+        sleep_terms = []
+
+        for ic in candidate_ics:
+            # AO 여부 (create_solver_model에서 이미 만든 BoolVar)
+            ao = is_always_on_path[ic.name]
+
+            # AO면 Iop 포함
+            ao_term = int(ic.operating_current * SCALE) * ao
+
+            # 비-AO 탑레벨(배터리 직결) 판정: z_top_non_ao = (battery→ic) AND (NOT ao)
+            top_edge = edges.get((battery.name, ic.name), None)
+            if top_edge is not None:
+                not_ao = model.NewBoolVar(f"not_ao_{ic.name}")
+                model.Add(not_ao + ao == 1)  # not_ao = 1 - ao
+
+                z_top_non_ao = model.NewBoolVar(f"top_non_ao_{ic.name}")
+                # z = top_edge ∧ not_ao (표준 선형화)
+                model.Add(z_top_non_ao <= top_edge)
+                model.Add(z_top_non_ao <= not_ao)
+                model.Add(z_top_non_ao >= top_edge + not_ao - 1)
+
+                iq_term = int(ic.quiescent_current * SCALE) * z_top_non_ao
+                sleep_terms.append(ao_term + iq_term)
+            else:
+                # 탑레벨이 아닌 비-AO는 0, AO면 ao_term만
+                sleep_terms.append(ao_term)
+
+        # AO 로드의 슬립 부하만 합산
+        load_sleep_total = int(sum(l.current_sleep for l in loads if l.always_on_in_sleep) * SCALE)
+
+        model.Add(sum(sleep_terms) + load_sleep_total <= int(constraints['max_sleep_current'] * SCALE))
+
+
+
+
+
+
     cost_objective = sum(int(ic.cost * 10000) * ic_is_used[ic.name] for ic in candidate_ics)
     model.Minimize(cost_objective)
     
