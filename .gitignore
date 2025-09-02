@@ -10,3 +10,6 @@ __pycache__/
 *.pyc
 *.py[cod]
 *$py.class
+
+# png 무시
+*.png
