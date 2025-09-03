@@ -262,30 +262,44 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
     return model, edges, ic_is_used
 # --- 💡 Independent Rail 제약조건 함수 ---
 def add_independent_rail_constraints(model, loads, candidate_ics, all_nodes, parent_nodes, edges):
+    """
+    독립 레일(Independent Rail) 제약 조건을 모델에 추가합니다.
+    - exclusive_path: 부하로 가는 경로 전체를 다른 부하와 공유하지 않습니다.
+    - exclusive_supplier: 부하에 전원을 공급하는 IC는 다른 어떤 자식도 가질 수 없습니다.
+    """
     all_ic_and_load_nodes = candidate_ics + loads
-    num_children_vars = {p.name: model.NewIntVar(0, len(all_ic_and_load_nodes), f"num_children_{p.name}") for p in parent_nodes}
+    
+    # 모든 자식(부하 + IC)의 수를 세는 변수
+    num_children_all = {p.name: model.NewIntVar(0, len(all_ic_and_load_nodes), f"num_children_all_{p.name}") for p in parent_nodes}
     for p in parent_nodes:
         outgoing_edges = [edges[p.name, c.name] for c in all_ic_and_load_nodes if (p.name, c.name) in edges]
-        model.Add(num_children_vars[p.name] == sum(outgoing_edges))
+        model.Add(num_children_all[p.name] == sum(outgoing_edges))
 
     for load in loads:
-        if load.independent_rail_type == 'soft':
+        rail_type = load.independent_rail_type
+
+        # exclusive_supplier: 부하/IC 통틀어 자식 1개
+        if rail_type == 'exclusive_supplier':
             for p_ic in candidate_ics:
                 if (p_ic.name, load.name) in edges:
-                    model.Add(num_children_vars[p_ic.name] == 1).OnlyEnforceIf(edges[(p_ic.name, load.name)])
+                    model.Add(num_children_all[p_ic.name] == 1).OnlyEnforceIf(edges[(p_ic.name, load.name)])
         
-        elif load.independent_rail_type == 'hard':
-            is_on_hard_path = {node.name: model.NewBoolVar(f"on_hard_path_{load.name}_{node.name}") for node in all_nodes}
-            model.Add(is_on_hard_path[load.name] == 1)
+        # exclusive_path: 경로 전체 격리
+        elif rail_type == 'exclusive_path':
+            is_on_exclusive_path = {node.name: model.NewBoolVar(f"on_exc_path_{load.name}_{node.name}") for node in all_nodes}
+            model.Add(is_on_exclusive_path[load.name] == 1)
             for other_load in loads:
                 if other_load.name != load.name:
-                    model.Add(is_on_hard_path[other_load.name] == 0)
+                    model.Add(is_on_exclusive_path[other_load.name] == 0)
+            
             for c_node in all_ic_and_load_nodes:
                 for p_node in parent_nodes:
                     if (p_node.name, c_node.name) in edges:
-                        model.AddImplication(is_on_hard_path[c_node.name], is_on_hard_path[p_node.name]).OnlyEnforceIf(edges[(p_node.name, c_node.name)])
+                        model.AddImplication(is_on_exclusive_path[c_node.name], is_on_exclusive_path[p_node.name]).OnlyEnforceIf(edges[(p_node.name, c_node.name)])
+            
             for p_ic in candidate_ics:
-                model.Add(num_children_vars[p_ic.name] <= 1).OnlyEnforceIf(is_on_hard_path[p_ic.name])
+                # 이 경로 위에 있는 IC는 다른 어떤 자식도 가질 수 없음
+                model.Add(num_children_all[p_ic.name] <= 1).OnlyEnforceIf(is_on_exclusive_path[p_ic.name])
 
 
 # --- 💡 Always-On 및 Sleep Current 제약조건 함수 ---

@@ -9,6 +9,7 @@ def check_solution_validity(solution, candidate_ics, loads, battery, constraints
     candidate_ics_map = {ic.name: ic for ic in candidate_ics}
     loads_map = {load.name: load for load in loads}
     parent_to_children = defaultdict(list)
+    child_to_parent = {c: p for p, c in solution['active_edges']}
     for p, c in solution['active_edges']: parent_to_children[p].append(c)
     
     # 1. 전류 한계 검증
@@ -35,15 +36,27 @@ def check_solution_validity(solution, candidate_ics, loads, battery, constraints
             print(f" -> ❌ 전기적 전류 마진 위반 ({p_name})")
             return False
 
-    # 2. Independent Rail 검증
-    independent_loads = {l.name for l in loads if l.independent_rail_type in ['soft', 'hard']}
-    for p_name, children_names in parent_to_children.items():
-        children_set = set(children_names)
-        if children_set.intersection(independent_loads) and len(children_set) > 1:
-            print(f" -> ❌ Independent Rail 위반 ({p_name})")
-            return False
+    # 2. Independent Rail 검증 (단순화된 버전)
+    for load in loads:
+        rail_type = load.independent_rail_type
+        if not rail_type: continue
+        parent_name = child_to_parent.get(load.name)
+        if not parent_name or parent_name not in candidate_ics_map: continue
+        if rail_type == 'exclusive_supplier':
+            if len(parent_to_children[parent_name]) > 1:
+                print(f" -> ❌ Independent Rail 위반 ({parent_name}이 exclusive_supplier 규칙 위반)")
+                return False
+        elif rail_type == 'exclusive_path':
+            current_node = load.name
+            while current_node in child_to_parent:
+                parent = child_to_parent[current_node]
+                if parent == battery.name: break
+                if len(parent_to_children[parent]) > 1:
+                    print(f" -> ❌ Independent Rail 위반 ({parent}가 exclusive_path 규칙 위반)")
+                    return False
+                current_node = parent
 
-    # --- 💡 3. Power Sequence 검증 (강화된 로직) ---
+    # 3. Power Sequence 검증
     child_to_parent = {c: p for p, c in solution['active_edges']}
 
     def is_ancestor(ancestor_candidate, node, parent_map):
@@ -85,7 +98,7 @@ def check_solution_validity(solution, candidate_ics, loads, battery, constraints
     return True
 
 def visualize_tree(solution, candidate_ics, loads, battery, constraints, junction_temps, i_ins, i_outs, actual_i_ins_sleep, total_active_power, total_active_current, total_sleep_current, always_on_nodes):
-    """솔루션 시각화 함수 (색상 구분 기능 추가)"""
+    """솔루션 시각화 함수 (개선된 라벨링)"""
     dot = Digraph(comment=f"Power Tree - Cost ${solution['cost']:.2f}", format='png')
     dot.attr('node', shape='box', style='rounded,filled', fontname='Arial') # style에 'filled' 추가
 
@@ -130,10 +143,20 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
 
         label = f"💡 {load.name}\nActive: {load.voltage_typical}V | {load.current_active*1000:.1f}mA\n"
         if load.current_sleep > 0: label += f"Sleep: {load.current_sleep * 1000000:,.1f}µA\n"
+        
         conditions = []
-        if load.independent_rail_type: conditions.append("🔒 Independent")
-        if load.name in sequenced_loads: conditions.append("⛓️ Sequence")
-        if conditions: label += " ".join(conditions)
+        # --- 💡 다이어그램 라벨링 개선 ---
+        # "Independent" 대신 구체적인 규칙의 종류를 표시합니다.
+        if load.independent_rail_type:
+            conditions.append(f"🔒 {load.independent_rail_type}")
+        # --- 수정 끝 ---
+        
+        if load.name in sequenced_loads:
+            conditions.append("⛓️ Sequence")
+            
+        if conditions:
+            label += " ".join(conditions)
+            
         penwidth = '1'
         if load.always_on_in_sleep: penwidth = '3'
         dot.node(load.name, label, color='dimgray', fillcolor=fill_color, penwidth=penwidth)
