@@ -11,3 +11,10 @@ Set-ExecutionPolicy Bypass -Scope Process
 
 # 3. Code 실행
 python main.py
+
+
+
+# git hub 사용방법
+# git add . or git add 파일명
+# git commit -m "description"
+# git push origin master

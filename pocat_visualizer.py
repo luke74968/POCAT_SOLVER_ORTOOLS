@@ -8,7 +8,6 @@ def check_solution_validity(solution, candidate_ics, loads, battery, constraints
     print("  -> 검증 중...", end="")
     candidate_ics_map = {ic.name: ic for ic in candidate_ics}
     loads_map = {load.name: load for load in loads}
-    is_valid = True
     parent_to_children = defaultdict(list)
     for p, c in solution['active_edges']: parent_to_children[p].append(c)
     
@@ -22,36 +21,65 @@ def check_solution_validity(solution, candidate_ics, loads, battery, constraints
             elif c_name in candidate_ics_map:
                 child_ic = candidate_ics_map[c_name]
                 child_children = parent_to_children.get(c_name, [])
+                # Grandchildren current calculation needs to be recursive for full accuracy,
+                # but this is a simplified check.
                 child_i_out = sum(loads_map[gc_name].current_active for gc_name in child_children if gc_name in loads_map)
                 actual_i_out += child_ic.calculate_input_current(child_ic.vin, child_i_out)
-        limit = parent_ic.i_limit * (1 + constraints.get('current_margin', 0.1))
-        if actual_i_out > limit: is_valid = False; break
-    if not is_valid:
-        print(" -> ❌ 전류 한계 위반")
-        return False
-    
+        
+        # p.i_limit is already derated for thermal constraints.
+        if actual_i_out > parent_ic.i_limit:
+            print(f" -> ❌ 열-전류 한계 위반 ({p_name})")
+            return False
+        # p.original_i_limit is the original electrical spec.
+        if actual_i_out > parent_ic.original_i_limit * (1 - constraints.get('current_margin', 0.1)):
+            print(f" -> ❌ 전기적 전류 마진 위반 ({p_name})")
+            return False
+
     # 2. Independent Rail 검증
-    independent_loads = {l.name for l in loads if l.independent_rail_type == 'soft' or l.independent_rail_type == 'hard'}
+    independent_loads = {l.name for l in loads if l.independent_rail_type in ['soft', 'hard']}
     for p_name, children_names in parent_to_children.items():
         children_set = set(children_names)
         if children_set.intersection(independent_loads) and len(children_set) > 1:
-            is_valid = False; break
-    if not is_valid:
-        print(" -> ❌ Independent Rail 위반")
+            print(f" -> ❌ Independent Rail 위반 ({p_name})")
+            return False
+
+    # --- 💡 3. Power Sequence 검증 (강화된 로직) ---
+    child_to_parent = {c: p for p, c in solution['active_edges']}
+
+    def is_ancestor(ancestor_candidate, node, parent_map):
+        """node로부터 최상위(배터리)까지 거슬러 올라가면서 ancestor_candidate가 있는지 확인"""
+        current_node = node
+        while current_node in parent_map:
+            parent = parent_map[current_node]
+            if parent == ancestor_candidate:
+                return True
+            current_node = parent
         return False
     
     # 3. Power Sequence 검증
     for rule in constraints.get('power_sequences', []):
-        j, k = rule['j'], rule['k']
-        j_parent, k_parent = None, None
-        for p, c in solution['active_edges']:
-            if c == j: j_parent = p
-            if c == k: k_parent = p
-        if j_parent is not None and j_parent == k_parent:
-            is_valid = False; break
-    if not is_valid:
-        print(" -> ❌ Power Sequence 위반")
-        return False
+        if rule.get('f') != 1:
+            continue
+        
+        j_name, k_name = rule['j'], rule['k'] # j가 k보다 먼저 켜져야 함
+        
+        j_parent = child_to_parent.get(j_name)
+        k_parent = child_to_parent.get(k_name)
+
+        if not j_parent or not k_parent:
+            # 해답에 j 또는 k가 없는 경우, 이 규칙은 검증할 필요가 없음
+            continue
+            
+        # 3a. 기존 제약: 같은 부모를 가지면 안 됨
+        if j_parent == k_parent:
+            print(f" -> ❌ Power Sequence 위반 ({j_name}와 {k_name}가 동일 부모 {j_parent} 공유)")
+            return False
+        
+        # 3b. 새로운 제약: k의 부모가 j의 부모의 조상이면 안 됨 (시간적 위배)
+        # 즉, k_parent -> ... -> j_parent 경로가 존재하면 안 됨
+        if is_ancestor(ancestor_candidate=k_parent, node=j_parent, parent_map=child_to_parent):
+            print(f" -> ❌ Power Sequence 위반 ({k_parent}가 {j_parent}의 전원 경로 상위에 있음)")
+            return False
 
     print(" -> ✅ 유효")
     return True
