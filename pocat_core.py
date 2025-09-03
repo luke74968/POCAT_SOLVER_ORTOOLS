@@ -317,23 +317,167 @@ def add_always_on_constraints(model, all_nodes, loads, candidate_ics, edges):
 
 
 def add_sleep_current_constraints(model, battery, candidate_ics, loads, constraints, edges, is_always_on_path):
+    """
+    Sleep-current constraint (battery viewpoint):
+    - AO 레일: Iop 반영
+    - 비-AO '탑레벨'(배터리 직결) 레일: Iq 반영
+    - AO 부하의 sleep 전류를 상위로 전파
+    - LDO: I_in = I_out
+    - Buck: q*I_in = p*I_out  (p/q ≈ Vout / (Vin * eff_guess))
+    - 모든 곱은 Bool 게이팅/정수비로 선형화
+    """
+    from pocat_classes import LDO, BuckConverter
+
     SCALE = 1_000_000
-    if constraints.get('max_sleep_current', 0) > 0:
-        sleep_terms = []
-        for ic in candidate_ics:
-            ao = is_always_on_path[ic.name]
-            ao_term = int(ic.operating_current * SCALE) * ao
-            top_edge = edges.get((battery.name, ic.name), None)
-            if top_edge is not None:
-                not_ao = model.NewBoolVar(f"not_ao_{ic.name}"); model.Add(not_ao + ao == 1)
-                z_top_non_ao = model.NewBoolVar(f"top_non_ao_{ic.name}")
-                model.Add(z_top_non_ao <= top_edge); model.Add(z_top_non_ao <= not_ao); model.Add(z_top_non_ao >= top_edge + not_ao - 1)
-                iq_term = int(ic.quiescent_current * SCALE) * z_top_non_ao
-                sleep_terms.append(ao_term + iq_term)
-            else:
-                sleep_terms.append(ao_term)
-        load_sleep_total = int(sum(l.current_sleep for l in loads if l.always_on_in_sleep) * SCALE)
-        model.Add(sum(sleep_terms) + load_sleep_total <= int(constraints['max_sleep_current'] * SCALE))
+    max_sleep = constraints.get('max_sleep_current', 0.0)
+    if max_sleep <= 0:
+        return
+
+
+
+    # ---------------- helpers ----------------
+    def bool_and(a, b, name):
+        """w = a AND b (동치)"""
+        w = model.NewBoolVar(name)
+        model.Add(w <= a)
+        model.Add(w <= b)
+        model.Add(w >= a + b - 1)
+        return w
+
+    def gate_const_by_bool(const_int, b, name):
+        """y = const if b else 0"""
+        y = model.NewIntVar(0, max(0, const_int), name)
+        model.Add(y == const_int).OnlyEnforceIf(b)
+        model.Add(y == 0).OnlyEnforceIf(b.Not())
+        return y
+
+    def gate_int_by_bool(x, ub, b, name):
+        """y = x if b else 0  (x: IntVar, ub: 상한)"""
+        y = model.NewIntVar(0, max(0, ub), name)
+        model.Add(y == x).OnlyEnforceIf(b)
+        model.Add(y == 0).OnlyEnforceIf(b.Not())
+        return y
+
+    # 넉넉한 상한(UB) 계산
+    total_load_sleep = sum(max(0, int(ld.current_sleep * SCALE)) for ld in loads)
+    total_ic_self = sum(max(0, int(max(ic.operating_current, ic.quiescent_current) * SCALE)) for ic in candidate_ics)
+    NODE_UB = total_load_sleep + total_ic_self + 1
+
+    # 각 노드 "입력핀에서 요구하는 슬립전류" 변수 미리 생성
+    node_sleep_in = {}      # name -> IntVar
+    node_sleep_ub = {}      # name -> int(UB)
+
+    # Loads: AO일 때 고정값, 아니면 0
+    for ld in loads:
+        const_val = max(0, int(ld.current_sleep * SCALE))
+        v = model.NewIntVar(0, const_val, f"sleep_in_{ld.name}")
+        model.Add(v == const_val).OnlyEnforceIf(is_always_on_path[ld.name])
+        model.Add(v == 0).OnlyEnforceIf(is_always_on_path[ld.name].Not())
+        node_sleep_in[ld.name] = v
+        node_sleep_ub[ld.name] = const_val
+
+    # IC들: 우선 빈 변수를 만들어 두고, 아래에서 등식으로 정의
+    for ic in candidate_ics:
+        node_sleep_in[ic.name] = model.NewIntVar(0, NODE_UB, f"sleep_in_{ic.name}")
+        node_sleep_ub[ic.name] = NODE_UB
+
+    # IC별 제약 구성
+    for ic in candidate_ics:
+        ao_ic = is_always_on_path[ic.name]
+        top_edge = edges.get((battery.name, ic.name), None)
+
+        # (A) 자기소모: AO면 Iop, 비-AO & top이면 Iq, 그 외 0  (세 경우가 딱 한 개만 참)
+        iop = max(0, int(ic.operating_current * SCALE))
+        iq  = max(0, int(ic.quiescent_current * SCALE))
+        ic_self = model.NewIntVar(0, max(iop, iq), f"sleep_self_{ic.name}")
+
+        non_ao = model.NewBoolVar(f"non_ao_{ic.name}")
+        model.Add(non_ao + ao_ic == 1)
+
+        if top_edge is not None:
+            # b1 := ao_ic
+            b1 = ao_ic
+            # b2 := (non_ao AND top_edge)
+            b2 = bool_and(non_ao, top_edge, f"non_ao_top_{ic.name}")
+            # b3 := (non_ao AND NOT top_edge)
+            not_top = model.NewBoolVar(f"not_top_{ic.name}")
+            model.Add(not_top + top_edge == 1)
+            b3 = bool_and(non_ao, not_top, f"non_ao_not_top_{ic.name}")
+
+            # 세 경우가 정확히 하나만 성립
+            model.Add(b1 + b2 + b3 == 1)
+
+            model.Add(ic_self == iop).OnlyEnforceIf(b1)
+            model.Add(ic_self == iq ).OnlyEnforceIf(b2)
+            model.Add(ic_self == 0  ).OnlyEnforceIf(b3)
+        else:
+            # 배터리 직결이 아닌 경우: AO면 Iop, 아니면 0
+            model.Add(ic_self == iop).OnlyEnforceIf(ao_ic)
+            model.Add(ic_self == 0  ).OnlyEnforceIf(ao_ic.Not())
+
+        # (B) 자식 요구 전류 합산 (AO 자식만, 엣지 선택 시만 반영)
+        children = [c for c in (candidate_ics + loads) if (ic.name, c.name) in edges]
+        child_terms = []
+        ub_sum = 0
+        for c in children:
+            edge_ic_c = edges[(ic.name, c.name)]
+            use_c = bool_and(edge_ic_c, is_always_on_path[c.name], f"use_sleep_{ic.name}__{c.name}")
+            ub_c = node_sleep_ub[c.name]
+            term = gate_int_by_bool(node_sleep_in[c.name], ub_c, use_c, f"sleep_term_{ic.name}__{c.name}")
+            child_terms.append(term)
+            ub_sum += ub_c
+
+        children_out = model.NewIntVar(0, max(0, ub_sum), f"sleep_out_{ic.name}")
+        model.Add(children_out == (sum(child_terms) if child_terms else 0))
+
+        # (C) 입력측 변환: LDO=1배, Buck=p/q
+        in_for_children = model.NewIntVar(0, NODE_UB, f"sleep_children_in_{ic.name}")
+        if isinstance(ic, LDO):
+            model.Add(in_for_children == children_out)
+        elif isinstance(ic, BuckConverter):
+            # I_in = I_out * Vout/(Vin*eff_guess)  → q*I_in = p*I_out
+            # Vin 후보가 고정 인스턴스(12V or 하위 레벨)로 들어온다는 전제
+
+            # 보수적 슬립 효율 추정
+            eff_sleep = getattr(ic,'eff_sleep',None)
+            if not eff_sleep or eff_sleep <=0:
+                eff_sleep = constraints.get('sleep_efficiency_guess',0.35)
+            # 너무 과격/후한 값을 방지하기 위한 안전 범위
+            eff_sleep = max(0.05,min(eff_sleep,0.85))
+
+            # 1) ic.vin 있으면 그걸 쓰고, 없으면 배터리의 최저전압을 씀
+            vin_ref = getattr(ic, 'vin', 0.0) or battery.voltage_min
+            # 2) 최종적으로 '가능한 가장 낮은' Vin을 선택 (보수적)
+            vin_ref = min(vin_ref, battery.voltage_min)
+            # 3) 분모에 들어갈 V_in * η (효율) 계산. 0으로 나눔 방지용 최소치 포함
+            vin_eff = max(1e-6, vin_ref * eff_sleep)
+
+            vout = max(0.0, ic.vout)
+            p = max(1, int(round(vout    * 1000)))   # 정수화
+            q = max(1, int(round(vin_eff * 1000)))
+            model.Add(in_for_children * q == children_out * p)
+        else:
+            model.Add(in_for_children == children_out)  # 안전 기본값
+
+        # (D) 총 입력 = 자기소모 + 자식 공급을 위한 입력
+        total_in = model.NewIntVar(0, NODE_UB, f"sleep_total_in_{ic.name}")
+        model.Add(total_in == ic_self + in_for_children)
+        model.Add(node_sleep_in[ic.name] == total_in)
+
+    # (E) 배터리 관점 슬립전류: 배터리 직결 노드만 합산
+    top_children = [c for c in (candidate_ics + loads) if (battery.name, c.name) in edges]
+    final_terms = []
+    for c in top_children:
+        edge_batt_c = edges[(battery.name, c.name)]
+        if isinstance(c, Load):
+            # 안전하게 AO도 함께 게이팅 (실제로는 load 변수 내부에서 0/const로 처리됨)
+            use_top = bool_and(edge_batt_c, is_always_on_path[c.name], f"top_use_{c.name}")
+            const_val = node_sleep_ub[c.name]
+            final_terms.append(gate_const_by_bool(const_val, use_top, f"top_term_{c.name}"))
+        else:
+            final_terms.append(gate_int_by_bool(node_sleep_in[c.name], node_sleep_ub[c.name], edge_batt_c, f"top_term_{c.name}"))
+
+    model.Add(sum(final_terms) <= int(max_sleep * SCALE))
 
 # 💡 원본의 병렬해 탐색 함수 수정
 def find_all_load_distributions(base_solution, candidate_ics, loads, battery, constraints, viz_func, check_func):
