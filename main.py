@@ -1,6 +1,7 @@
 # main.py
 
 import json
+import sys
 from dataclasses import asdict
 from ortools.sat.python import cp_model
 
@@ -15,12 +16,22 @@ from pocat_preprocess import prune_dominated_ic_instances
 
 def main():
     """메인 실행 함수"""
+    # 💡 2. 명령행에서 파일 경로를 확인하고 가져옵니다.
+    if len(sys.argv) < 2:
+        print("오류: 설정 파일(.json)을 명령행 인자로 전달해야 합니다.")
+        print("사용법: python main.py <config_filename.json>")
+        return
+    
+    config_filename = sys.argv[1]
+    print(f"📖 설정 파일 '{config_filename}' 로딩...")
+
     # 1. 설정 로드
     try:
-        with open('config.json', 'r', encoding='utf-8') as f:
+        # 💡 3. 하드코딩된 'config.json' 대신 전달받은 파일 이름을 사용합니다.
+        with open(config_filename, 'r', encoding='utf-8') as f:
             json_config_string = f.read()
     except FileNotFoundError:
-        print("오류: 설정 파일 'config.json'을(를) 찾을 수 없습니다.")
+        print(f"오류: 설정 파일 '{config_filename}'을(를) 찾을 수 없습니다.")
         return
         
     battery, available_ics, loads, constraints = load_configuration(json_config_string)

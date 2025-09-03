@@ -10,7 +10,7 @@ Set-ExecutionPolicy Bypass -Scope Process
 .\venv\Scripts\activate
 
 # 3. Code 실행
-python main.py
+# python main.py json 파일명
 
 
 
