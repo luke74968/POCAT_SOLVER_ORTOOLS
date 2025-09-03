@@ -117,6 +117,8 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
     all_ic_and_load_nodes = candidate_ics + loads
     parent_nodes = [battery] + candidate_ics
     all_nodes = parent_nodes + loads
+    node_names = [n.name for n in all_nodes]
+    ic_names = [ic.name for ic in candidate_ics]
     edges = {}
     
     for p in parent_nodes:
@@ -175,6 +177,54 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
             # 2. 전기 마진이 적용된 전류 한계 (설계 여유분)
             # p.original_i_limit은 derating 전의 원래 스펙
             model.Add(sum(terms) <= int(p.original_i_limit * (1 - current_margin) * SCALE))
+
+        # --- 💡 로직 개선: 전원 시퀀스 제약 강화 ---
+    if 'power_sequences' in constraints and constraints['power_sequences']:
+        # 1. 경로 추적을 위한 is_ancestor 변수 생성
+        is_ancestor = {
+            (p, c): model.NewBoolVar(f'anc_{p}_to_{c}')
+            for p in node_names for c in node_names if p != c
+        }
+        # 2. 경로 제약 조건 설정 (A->B이고 B->C이면, A->C이다)
+        for p, c in edges: # 직접 연결은 조상 관계
+            model.AddImplication(edges[p, c], is_ancestor[p, c])
+        for a in node_names: # 간접 연결(경로)도 조상 관계 (Transitive Closure)
+            for b in ic_names:
+                for c in node_names:
+                    if a == b or b == c or a == c: continue
+                    # (a->b)이고 (b->c)이면 (a->c)가 참이 되어야 함
+                    model.AddBoolOr([
+                        is_ancestor[a, b].Not(),
+                        is_ancestor[b, c].Not(),
+                        is_ancestor[a, c]
+                    ])
+        
+        # 3. 강화된 시퀀스 제약 적용
+        parent_ic_vars = defaultdict(list)
+        for load in loads:
+            for p_ic in candidate_ics:
+                if (p_ic.name, load.name) in edges:
+                    parent_ic_vars[load.name].append((p_ic.name, edges[p_ic.name, load.name]))
+
+        for seq in constraints['power_sequences']:
+            if seq.get('f') != 1: continue
+            j_name, k_name = seq['j'], seq['k'] # j가 k보다 먼저 켜져야 함
+
+            # 기존 제약 (같은 부모 금지)은 여전히 유효
+            for p in candidate_ics:
+                if (p.name, j_name) in edges and (p.name, k_name) in edges:
+                    model.Add(edges[p.name, j_name] + edges[p.name, k_name] <= 1)
+            
+            # 새로운 제약 (시간적 선후 관계)
+            # "k의 부모 IC"는 "j의 부모 IC"의 자손이 될 수 없다.
+            # 즉, j_parent는 k_parent의 조상이 될 수 없다.
+            for p_j_name, j_edge in parent_ic_vars[j_name]:
+                for p_k_name, k_edge in parent_ic_vars[k_name]:
+                    if p_j_name == p_k_name: continue # 이미 위에서 처리됨
+                    
+                    # is_ancestor[k_parent, j_parent]가 참이 되는 것을 방지
+                    model.Add(is_ancestor[p_k_name, p_j_name] == 0).OnlyEnforceIf([j_edge, k_edge])
+
     # --- 수정 끝 ---
         
     if 'power_sequences' in constraints:

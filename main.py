@@ -48,11 +48,13 @@ def main():
     print(f"   - 남은 후보 IC 인스턴스: {pruned_count}개")
 
     # --- 💡 결과 표시 방법 개선 ---
+    """
     if dominance_map:
         print("\n--- 🗑️ 제거된 IC 목록 (원인: 더 우수한 IC) ---")
         # 제거된 IC 이름을 기준으로 정렬하여 출력합니다.
         for removed_name, dominant_name in sorted(dominance_map.items()):
             print(f"   - {removed_name:<50} (by ▶️  {dominant_name})")
+    """
     sanitized_ic_groups = {}
     for group_key, group_list in ic_groups.items():
         # 각 그룹 리스트에서 살아남은 IC 이름만 필터링하여 새로운 리스트 생성
