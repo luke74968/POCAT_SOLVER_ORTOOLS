@@ -32,8 +32,11 @@
       { "j": "DDR_Core", "k": "eMMC_Memory", "f": 1 }
     ],
     "thermal_margin_percent": 0.10,
-    "max_sleep_current": 0.0091
- 
-
+    "max_sleep_current": 0.0091,
+    
+    "parallel_search_settings": {
+      "enabled": true,
+      "max_solutions_to_generate": 100
+    }
   }
 }

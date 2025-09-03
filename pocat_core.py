@@ -335,15 +335,31 @@ def add_sleep_current_constraints(model, battery, candidate_ics, loads, constrai
         load_sleep_total = int(sum(l.current_sleep for l in loads if l.always_on_in_sleep) * SCALE)
         model.Add(sum(sleep_terms) + load_sleep_total <= int(constraints['max_sleep_current'] * SCALE))
 
-# 원본의 병렬해 탐색 함수
+# 💡 원본의 병렬해 탐색 함수 수정
 def find_all_load_distributions(base_solution, candidate_ics, loads, battery, constraints, viz_func, check_func):
+    """
+    대표 해를 기반으로, 부하를 재분배하여 가능한 모든 유효한 병렬해를 탐색합니다.
+    config.json의 설정에 따라 실행 여부와 최대 탐색 개수가 제어됩니다.
+    """
+    # 설정 가져오기 (없으면 기본값 사용)
+    search_settings = constraints.get('parallel_search_settings', {})
+    if not search_settings.get('enabled', False):
+        print("\n👑 --- 병렬 해 탐색 비활성화됨 --- 👑")
+        # 비활성화 시, 대표 해만 검증하고 시각화
+        if check_func(base_solution, candidate_ics, loads, battery, constraints):
+            viz_func(base_solution, candidate_ics, loads, battery, constraints, solution_index=1)
+        return
+
     print("\n\n👑 --- 최종 단계: 모든 부하 분배 조합 탐색 --- 👑")
+    max_solutions = search_settings.get('max_solutions_to_generate', 500) # 최대 탐색 개수 제한
+
     candidate_ics_map = {ic.name: ic for ic in candidate_ics}
     ic_type_to_instances = defaultdict(list)
     for ic_name in base_solution['used_ic_names']:
-        ic = candidate_ics_map[ic_name]
-        ic_type = f"📦 {ic.name.split('@')[0]} ({ic.vout:.1f}Vout)"
-        ic_type_to_instances[ic_type].append(ic)
+        ic = candidate_ics_map.get(ic_name)
+        if ic:
+            ic_type = f"📦 {ic.name.split('@')[0]} ({ic.vout:.1f}Vout)"
+            ic_type_to_instances[ic_type].append(ic)
 
     instance_to_children = defaultdict(set)
     for p, c in base_solution['active_edges']:
@@ -356,16 +372,17 @@ def find_all_load_distributions(base_solution, candidate_ics, loads, battery, co
             total_load_pool = set()
             for inst in instances:
                 total_load_pool.update(instance_to_children[inst.name])
-            target_group = {
-                'instances': [inst.name for inst in instances],
-                'load_pool': list(total_load_pool)
-            }
-            break
+            if total_load_pool:
+                target_group = {
+                    'instances': [inst.name for inst in instances],
+                    'load_pool': list(total_load_pool)
+                }
+                break
 
     if not target_group:
         print("\n -> 이 해답에는 생성할 병렬해가 없습니다.")
         if check_func(base_solution, candidate_ics, loads, battery, constraints):
-             viz_func(base_solution, candidate_ics, loads, battery, constraints, solution_index=1)
+            viz_func(base_solution, candidate_ics, loads, battery, constraints, solution_index=1)
         return
 
     def find_partitions(items, num_bins):
@@ -382,8 +399,13 @@ def find_all_load_distributions(base_solution, candidate_ics, loads, battery, co
     seen_partitions = set()
     num_instances = len(target_group['instances'])
     load_pool = target_group['load_pool']
+    solution_count = 0
 
     for p in find_partitions(load_pool, num_instances):
+        if solution_count >= max_solutions:
+            print(f"\n⚠️ 경고: 병렬 해 조합이 너무 많아 {max_solutions}개에서 탐색을 중단합니다.")
+            break
+            
         if len(p) == num_instances:
             canonical_partition = tuple(sorted([tuple(sorted(sublist)) for sublist in p]))
             if canonical_partition in seen_partitions:
@@ -396,7 +418,7 @@ def find_all_load_distributions(base_solution, candidate_ics, loads, battery, co
             new_solution = {"used_ic_names": base_solution['used_ic_names'], "active_edges": new_edges, "cost": base_solution['cost']}
             if check_func(new_solution, candidate_ics, loads, battery, constraints):
                 valid_solutions.append(new_solution)
-    
+        solution_count += 1
     print(f"\n✅ 총 {len(valid_solutions)}개의 유효한 병렬해 구조를 찾았습니다.")
     for i, solution in enumerate(valid_solutions):
         print(f"\n--- [병렬해 #{i+1}] ---")
