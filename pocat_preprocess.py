@@ -26,17 +26,26 @@ def _extract_specs(ic: Dict) -> Dict:
     비용/면적/손실 등 목적함수 축은 제외 (전처리에서 건드리지 않기 위함).
     """
     typ = _norm_type(_get(ic, "type", "DCDC"))
-    vin_min = float(_get(ic, "vin_min", _get(ic, "V_in_min", 0.0)))
-    vin_max = float(_get(ic, "vin_max", _get(ic, "V_in_max", 999.0)))
 
-    # vout: range 또는 fixed를 모두 지원
-    if "vout_fixed" in ic:
+    # --- 💡 로직 수정: 구체적인 vin/vout 값을 최우선으로 사용 ---
+    # expand_ic_instances에서 생성된 구체적인 vin 값이 있으면, 그 값을 기준으로 삼는다.
+    if _get(ic, "vin", 0.0) > 0.0:
+        vin_min = vin_max = float(ic["vin"])
+    else:
+        vin_min = float(_get(ic, "vin_min", _get(ic, "V_in_min", 0.0)))
+        vin_max = float(_get(ic, "vin_max", _get(ic, "V_in_max", 999.0)))
+
+    # 구체적인 vout 값이 있으면, 그 값을 기준으로 삼는다.
+    if _get(ic, "vout", 0.0) > 0.0:
+        vout_min = vout_max = float(ic["vout"])
+    elif "vout_fixed" in ic:
         vout_min = vout_max = float(ic["vout_fixed"])
     elif "V_out" in ic and isinstance(ic["V_out"], (int, float)):
         vout_min = vout_max = float(ic["V_out"])
     else:
         vout_min = float(_get(ic, "vout_min", _get(ic, "V_out_min", 0.0)))
         vout_max = float(_get(ic, "vout_max", _get(ic, "V_out_max", 999.0)))
+    # --- 수정 끝 ---
 
     # 출력 전류 (용량)
     i_limit = float(_get(ic, "i_limit", _get(ic, "I_out_max", 0.0)))
@@ -44,17 +53,19 @@ def _extract_specs(ic: Dict) -> Dict:
     # LDO dropout (작을수록 우위)
     v_dropout = float(_get(ic, "v_dropout_min", _get(ic, "V_dropout_min", 999.0)))
 
-    # 온도 스펙(선택적으로 포함)
-    theta_ja = float(_get(ic, "theta_ja", _get(ic, "RθJA", 0.0)))
+    # 온도 스펙
+    theta_ja = float(_get(ic, "theta_ja", _get(ic, "RθJA", 999.0)))
     tj_max   = float(_get(ic, "t_junction_max", _get(ic, "Tj_max", 0.0)))
 
     cost = float(_get(ic, "cost", 1e9))  # 없으면 매우 큰 비용으로 가정
+    quiescent_current = float(_get(ic, "quiescent_current", 999.0)) #대기전력 추가 
 
     return dict(
         type=typ, vin_min=vin_min, vin_max=vin_max,
         vout_min=vout_min, vout_max=vout_max,
         i_limit=i_limit, v_dropout=v_dropout,
-        theta_ja=theta_ja, tj_max=tj_max, cost=cost
+        theta_ja=theta_ja, tj_max=tj_max, cost=cost,
+        quiescent_current=quiescent_current
     )
 
 def _dominates_b_over_a(a_spec: Dict, b_spec: Dict) -> bool:
@@ -73,42 +84,42 @@ def _dominates_b_over_a(a_spec: Dict, b_spec: Dict) -> bool:
     if a_spec["type"] != b_spec["type"]:
         return False
 
+    # 이제 vin/vout이 동일한 인스턴스끼리만 비교되므로, 이 조건은 항상 참이 된다.
     include_vin  = (b_spec["vin_min"] <= a_spec["vin_min"] and b_spec["vin_max"] >= a_spec["vin_max"])
     include_vout = (b_spec["vout_min"] <= a_spec["vout_min"] and b_spec["vout_max"] >= a_spec["vout_max"])
     i_ok = (b_spec["i_limit"] >= a_spec["i_limit"])
     ld_ok = True
     if a_spec["type"] == "LDO":
         ld_ok = (b_spec["v_dropout"] <= a_spec["v_dropout"])
+    thermal_ok = (b_spec["theta_ja"] <= a_spec["theta_ja"])
     tj_ok = (b_spec["tj_max"] >= a_spec["tj_max"])
     cost_ok = (b_spec["cost"] <= a_spec["cost"])
+    iq_ok = (b_spec["quiescent_current"] <= a_spec["quiescent_current"])
 
-    if not (include_vin and include_vout and i_ok and ld_ok and tj_ok and cost_ok):
+    if not (include_vin and include_vout and i_ok and ld_ok and thermal_ok and tj_ok and cost_ok and iq_ok):
         return False
 
     strict = (
-        (b_spec["vin_min"] < a_spec["vin_min"]) or
-        (b_spec["vin_max"] > a_spec["vin_max"]) or
-        (b_spec["vout_min"] < a_spec["vout_min"]) or
-        (b_spec["vout_max"] > a_spec["vout_max"]) or
         (b_spec["i_limit"]  > a_spec["i_limit"])  or
         (a_spec["type"] == "LDO" and b_spec["v_dropout"] < a_spec["v_dropout"]) or
+        (b_spec["theta_ja"] < a_spec["theta_ja"]) or
         (b_spec["tj_max"]   > a_spec["tj_max"])   or
-        (b_spec["cost"]     < a_spec["cost"])
+        (b_spec["cost"]     < a_spec["cost"])   or
+        (b_spec["quiescent_current"] < a_spec["quiescent_current"])
     )
     return strict
-
-def prune_dominated_ic_instances(ic_list: List[Dict]) -> Tuple[List[Dict], List[Tuple[int,int]]]:
+# --- 💡 함수 반환 값 수정 ---
+def prune_dominated_ic_instances(ic_list: List[Dict]) -> Tuple[List[Dict], Dict[str, str]]:
     """
     입력: IC dict 리스트 (확장/복제 포함)
     출력:
       - 지배 제거 후 남긴 리스트(new_ics)
-      - (선택적) 경쟁자 컷용 지배쌍 리스트 dominated_pairs: (a_idx, b_idx) 의미: b가 a를 지배(b dominates a)
+      - 지배 관계 맵 dominance_map: {제거된 IC 이름: 제거한 IC 이름}
     """
     specs = [_extract_specs(ic) for ic in ic_list]
     keep = [True]*len(ic_list)
-    dominated_pairs: List[Tuple[int,int]] = []
+    dominance_map = {}  # 지배 관계를 저장할 딕셔너리
 
-    # O(n^2) 비교 (n=1,188 정도는 충분히 빠름)
     for i, a in enumerate(specs):
         if not keep[i]:
             continue
@@ -118,29 +129,14 @@ def prune_dominated_ic_instances(ic_list: List[Dict]) -> Tuple[List[Dict], List[
             if _dominates_b_over_a(a, b):
                 # j(b)가 i(a)를 지배 → a는 버려도 안전
                 keep[i] = False
-                dominated_pairs.append((i, j))
+                # 지배 관계를 {제거된 IC 이름: 제거한 IC 이름} 형태로 저장
+                dominance_map[ic_list[i]['name']] = ic_list[j]['name']
                 break
 
-    new_ics = []
-    old_to_new = {}
-    for old_idx, (ic, k) in enumerate(zip(ic_list, keep)):
-        if k:
-            old_to_new[old_idx] = len(new_ics)
-            # id/uid 보정: 없으면 새로 부여
-            ic = dict(ic)
-            if "id" not in ic and "uid" not in ic:
-                ic["uid"] = f"IC_{len(new_ics)}"
-            new_ics.append(ic)
-
-    # 지배쌍 인덱스도 새 인덱스로 재매핑 (남아있는 것만 유지)
-    remapped_pairs = []
-    for a_old, b_old in dominated_pairs:
-        if keep[a_old] or keep[b_old]:
-            # a_old는 버려졌으니 보통 안 남음. 혹시 둘 다 남아있으면(동률 케이스) 컷으로 쓰도록 남김
-            if a_old in old_to_new and b_old in old_to_new:
-                remapped_pairs.append((old_to_new[a_old], old_to_new[b_old]))
-
-    return new_ics, remapped_pairs
+    new_ics = [ic for ic, k in zip(ic_list, keep) if k]
+    
+    # 수정된 반환 값
+    return new_ics, dominance_map
 
 def group_competitor_families(ic_list: List[Dict]) -> List[List[int]]:
     """
