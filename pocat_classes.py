@@ -41,7 +41,9 @@ class BuckConverter(PowerIC):
     def calculate_power_loss(self, vin: float, i_out: float) -> float:
         p_out = self.vout * i_out; eff = self.get_efficiency(i_out)
         if eff == 0: return float('inf')
-        return (p_out / eff) - p_out
+                # 💡 수정: (vin * self.operating_current) 항을 추가하여 IC 자체 손실을 반영합니다.
+        conversion_loss = (p_out / eff) - p_out
+        return conversion_loss + (vin * self.operating_current)
     def calculate_input_current(self, vin: float, i_out: float) -> float:
         if vin == 0: return float('inf')
         p_out = self.vout * i_out; eff = self.get_efficiency(i_out)

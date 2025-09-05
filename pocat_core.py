@@ -61,12 +61,29 @@ def calculate_derated_current_limit(ic: PowerIC, constraints: Dict[str, Any]) ->
         numerator = p_loss_max - (vin * op_current); denominator = vin - vout
         if denominator > 0 and numerator > 0: i_limit_based_temp = numerator / denominator
     elif isinstance(ic, BuckConverter):
-        current_check = ic.i_limit
-        while current_check > 0:
-            if ic.calculate_power_loss(ic.vin, current_check) <= p_loss_max:
-                i_limit_based_temp = current_check; break
-            current_check -= 0.001
-        else: i_limit_based_temp = 0
+        # --- 💡 수정: 선형 스캔을 이진 탐색으로 변경 ---
+        low = 0.0
+        high = ic.i_limit
+        i_limit_based_temp = 0.0
+        
+        # 100회 반복으로 충분히 높은 정밀도를 얻을 수 있습니다 (2^100)
+        for _ in range(100): 
+            mid = (low + high) / 2
+            if mid < 1e-6: # 전류가 매우 작으면 탐색 중단
+                break
+                
+            # mid 전류에서의 전력 손실 계산
+            power_loss_at_mid = ic.calculate_power_loss(ic.vin, mid)
+            
+            if power_loss_at_mid <= p_loss_max:
+                # 허용 손실보다 작거나 같으면, 이 전류값은 유효함
+                # 더 높은 전류도 가능한지 탐색하기 위해 low를 mid로 이동
+                i_limit_based_temp = mid
+                low = mid
+            else:
+                # 허용 손실보다 크면, 전류를 낮춰야 함
+                high = mid
+        # --- 수정 끝 ---
     return min(ic.i_limit, i_limit_based_temp)
 
 def load_configuration(config_string: str) -> Tuple[Battery, List[PowerIC], List[Load], Dict[str, Any]]:
