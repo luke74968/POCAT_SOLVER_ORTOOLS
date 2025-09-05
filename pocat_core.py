@@ -211,8 +211,62 @@ def add_current_limit_constraints(model, candidate_ics, loads, constraints, edge
             model.Add(sum(terms) <= int(p.i_limit * SCALE))
             model.Add(sum(terms) <= int(p.original_i_limit * (1 - current_margin) * SCALE))
 
-def add_power_sequence_constraints(model, candidate_ics, loads, constraints, node_names, ic_names, edges):
-    """전원 시퀀스(동일 부모 금지, 시간적 선후 관계) 제약 조건을 추가합니다."""
+def add_power_sequence_constraints(model, candidate_ics, loads, battery, constraints, node_names, edges, ic_is_used):
+    """
+    (개선된 방식) 정수 '스테이지' 변수를 사용하여 전원 시퀀스 제약 조건을 효율적으로 추가합니다.
+    - edge(p->c)가 활성화되면 stage[c] > stage[p]
+    - 시퀀스 규칙(j가 k보다 먼저)이 있으면, k의 부모 IC 스테이지 > j의 부모 IC 스테이지
+    """
+    if 'power_sequences' not in constraints or not constraints['power_sequences']:
+        return
+
+    print("   - (개선) 스테이지 변수 기반 Power Sequence 제약 조건 추가...")
+
+    num_nodes = len(node_names)
+    # 1. 각 노드에 대한 스테이지 정수 변수 생성
+    stage = {name: model.NewIntVar(0, num_nodes - 1, f"stage_{name}") for name in node_names}
+
+    # 2. 배터리는 항상 스테이지 0으로 고정 (이제 'battery'가 정의되어 오류가 발생하지 않습니다)
+    model.Add(stage[battery.name] == 0)
+
+    # 3. 엣지가 활성화되면, 자식의 스테이지는 부모보다 커야 함
+    for (p_name, c_name), edge_var in edges.items():
+        # stage[c] >= stage[p] + 1
+        model.Add(stage[c_name] >= stage[p_name] + 1).OnlyEnforceIf(edge_var)
+
+    # 4. Power Sequence 규칙 적용
+    for seq in constraints['power_sequences']:
+        if seq.get('f') != 1:
+            continue
+        
+        j_name, k_name = seq['j'], seq['k']
+
+        # 각 부하(j, k)에 연결될 수 있는 모든 부모 IC 후보를 찾습니다.
+        j_parents = [(p.name, edges[p.name, j_name]) for p in candidate_ics if (p.name, j_name) in edges]
+        k_parents = [(p.name, edges[p.name, k_name]) for p in candidate_ics if (p.name, k_name) in edges]
+        
+        if not j_parents or not k_parents:
+            continue
+
+        # j와 k가 각각 어떤 부모에 연결되었을 때, 그 부모의 스테이지를 나타낼 변수
+        j_parent_stage = model.NewIntVar(0, num_nodes - 1, f"stage_parent_of_{j_name}")
+        k_parent_stage = model.NewIntVar(0, num_nodes - 1, f"stage_parent_of_{k_name}")
+        
+        # 부모-자식 관계가 활성화되면, 부모의 스테이지 값을 가져옴
+        for p_name, edge_var in j_parents:
+            model.Add(j_parent_stage == stage[p_name]).OnlyEnforceIf(edge_var)
+        for p_name, edge_var in k_parents:
+            model.Add(k_parent_stage == stage[p_name]).OnlyEnforceIf(edge_var)
+        
+        # 핵심 제약: k 부모의 스테이지가 j 부모의 스테이지보다 커야 한다 (시간적 선후 관계)
+        model.Add(k_parent_stage > j_parent_stage)
+
+        # 기존의 '동일 부모 금지' 규칙도 함께 적용
+        for p_ic_name, j_edge_var in j_parents:
+            for q_ic_name, k_edge_var in k_parents:
+                if p_ic_name == q_ic_name:
+                    model.AddBoolOr([j_edge_var.Not(), k_edge_var.Not()])
+    """전원 시퀀스(동일 부모 금지, 시간적 선후 관계) 제약 조건을 추가합니다
     if 'power_sequences' not in constraints or not constraints['power_sequences']:
         return
         
@@ -244,6 +298,7 @@ def add_power_sequence_constraints(model, candidate_ics, loads, constraints, nod
             for p_k_name, k_edge in parent_ic_vars[k_name]:
                 if p_j_name == p_k_name: continue
                 model.Add(is_ancestor[p_k_name, p_j_name] == 0).OnlyEnforceIf([j_edge, k_edge])
+    """            
 
 # --- 💡 3. 재구성된 메인 모델 생성 함수 수정 ---
 def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
@@ -263,7 +318,8 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
     add_base_topology_constraints(model, candidate_ics, loads, battery, edges, ic_is_used)
     add_ic_group_constraints(model, ic_groups, ic_is_used)
     add_current_limit_constraints(model, candidate_ics, loads, constraints, edges)
-    add_power_sequence_constraints(model, candidate_ics, loads, constraints, node_names, ic_names, edges)
+    #add_power_sequence_constraints(model, candidate_ics, loads, constraints, node_names, ic_names, edges)
+    add_power_sequence_constraints(model, candidate_ics, loads, battery, constraints, node_names, edges, ic_is_used)
     
     # `parent_nodes`를 올바르게 전달
     add_independent_rail_constraints(model, loads, candidate_ics, all_nodes, parent_nodes, edges)
@@ -277,6 +333,7 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
     
     print("✅ 모델 생성 완료!")
     return model, edges, ic_is_used
+
 # --- 💡 Independent Rail 제약조건 함수 ---
 def add_independent_rail_constraints(model, loads, candidate_ics, all_nodes, parent_nodes, edges):
     """
